@@ -53,6 +53,23 @@ The tpp presentation formats consists of normal text lines and special
 commands. Special commands are contained in lines that begin with "--"
 and the command name.
 
+Inline formatting tokens are supported within a line (ignored inside
+--beginoutput/--beginshelloutput blocks):
+.TP
+--b ... --/b
+bold
+.TP
+--u ... --/u
+underline
+.TP
+--rev ... --/rev
+reverse video
+.TP
+--c <color> ... --/c
+color (same names as --color)
+.PP
+Use \\-- to escape a token and print it literally.
+
 See /usr/share/doc/tpp/README for complete list of command names, and 
 /usr/share/doc/tpp/examples for TPP presentation examples, including
 presentation slides that have been in real-life presentations.

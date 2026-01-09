@@ -74,6 +74,9 @@ This should be bold
 ---
 --boldoff
 This should be normal again
+---
+--center Inline tokens: --b bold --/b, --u underline --/u, --rev reverse --/rev
+--center Colors: --c red red --/c and escape \\--b to show --b
 --newpage keys
 --heading Keys to Control TPP
 

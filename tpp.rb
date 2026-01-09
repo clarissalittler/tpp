@@ -201,6 +201,85 @@ class TppVisualizer
     return lines
   end
 
+  # Tokenizes inline formatting markers within a line. Returns an array of tokens:
+  # [:text, "literal"], [:style, :bold/:underline/:reverse, true/false],
+  # [:color, "red"], [:color_pop].
+  def scan_inline_tokens(text)
+    return [] if text == nil
+    tokens = []
+    buffer = ""
+    i = 0
+    while i < text.length
+      if text[i,1] == "\\" && text[i+1,2] == "--"
+        buffer << "--"
+        i += 3
+        next
+      end
+      if text[i,2] == "--"
+        token_info = parse_inline_token_at(text, i)
+        if token_info
+          tokens << [:text, buffer] if buffer.length > 0
+          buffer = ""
+          tokens << token_info[0]
+          i += token_info[1]
+          next
+        end
+      end
+      buffer << text[i,1]
+      i += 1
+    end
+    tokens << [:text, buffer] if buffer.length > 0
+    tokens
+  end
+
+  # Removes inline tokens and returns the plain text. Escaped tokens (\--b) are kept.
+  def strip_inline_tokens(text)
+    return "" if text == nil
+    out = ""
+    scan_inline_tokens(text).each do |token|
+      if token[0] == :text
+        out << token[1]
+      end
+    end
+    out
+  end
+
+  def parse_inline_token_at(text, index)
+    return [[:style, :bold, false], 4] if text[index,4] == "--/b"
+    return [[:style, :bold, true], 3] if text[index,3] == "--b"
+    return [[:style, :underline, false], 4] if text[index,4] == "--/u"
+    return [[:style, :underline, true], 3] if text[index,3] == "--u"
+    return [[:style, :reverse, false], 6] if text[index,6] == "--/rev"
+    return [[:style, :reverse, true], 5] if text[index,5] == "--rev"
+    return [[:color_pop], 4] if text[index,4] == "--/c"
+
+    if text[index,3] == "--c"
+      next_char = text[index + 3, 1]
+      return nil if next_char == nil || next_char !~ /\s/
+      j = index + 3
+      while text[j,1] =~ /\s/
+        j += 1
+      end
+      k = j
+      while k < text.length && text[k,1] =~ /[A-Za-z]/
+        k += 1
+      end
+      if k > j
+        color = text[j...k]
+        if valid_inline_color?(color)
+          return [[:color, color], k - index]
+        end
+      end
+    end
+    nil
+  end
+
+  def valid_inline_color?(color)
+    color == "white" || color == "yellow" || color == "red" ||
+      color == "green" || color == "blue" || color == "cyan" ||
+      color == "magenta" || color == "black" || color == "default"
+  end
+
   def do_footer(footer_text)
     $stderr.puts "Error: TppVisualizer#do_footer has been called directly."
     Kernel.exit(1)
@@ -487,7 +566,6 @@ class TppVisualizer
         @lastFileName = line.sub(/^--include-file /,"").strip
         do_beginoutput
         print_line(@lastFileName)
-        do_beginoutput
         f = File.open(@lastFileName)
         f.each_line do |fileLine|
           fileLine.chomp!
@@ -512,6 +590,8 @@ end
 # Implements an interactive visualizer which builds on top of ncurses.
 class NcursesVisualizer < TppVisualizer
 
+  StyleState = Struct.new(:bold, :underline, :reverse, :color)
+
   def initialize
     @figletfont = "standard"
     Ncurses.initscr
@@ -525,13 +605,267 @@ class NcursesVisualizer < TppVisualizer
     setsizes
     Ncurses.start_color()
     Ncurses.use_default_colors()
-    do_bgcolor("black")
-    #do_fgcolor("white")
     @fgcolor = ColorMap.get_color_pair("white")
     @voffset = 5
     @indent = 3
     @cur_line = @voffset
     @output = @shelloutput = false
+    @slideoutput = false
+    @style_state = StyleState.new(false, false, false, @fgcolor)
+    @active_style = StyleState.new(false, false, false, nil)
+    @last_status_len = 0
+    @style_support = { :bold => true, :underline => true, :reverse => true }
+    do_bgcolor("black")
+    #do_fgcolor("white")
+    apply_style(@style_state)
+  end
+
+  def copy_style(state)
+    StyleState.new(state.bold, state.underline, state.reverse, state.color)
+  end
+
+  def apply_style(state)
+    if state.bold != @active_style.bold
+      if state.bold then
+        safe_attron(:bold)
+      else
+        safe_attroff(:bold)
+      end
+      @active_style.bold = state.bold
+    end
+    if state.underline != @active_style.underline
+      if state.underline then
+        safe_attron(:underline)
+      else
+        safe_attroff(:underline)
+      end
+      @active_style.underline = state.underline
+    end
+    if state.reverse != @active_style.reverse
+      if state.reverse then
+        safe_attron(:reverse)
+      else
+        safe_attroff(:reverse)
+      end
+      @active_style.reverse = state.reverse
+    end
+    if state.color && state.color != @active_style.color
+      @screen.attron(Ncurses.COLOR_PAIR(state.color))
+      @active_style.color = state.color
+    end
+  end
+
+  def ncurses_attr(kind)
+    return Ncurses::A_BOLD if kind == :bold
+    return Ncurses::A_UNDERLINE if kind == :underline
+    return Ncurses::A_REVERSE if kind == :reverse
+    nil
+  end
+
+  def safe_attron(kind)
+    return unless @style_support[kind]
+    attr = ncurses_attr(kind)
+    return unless attr
+    begin
+      @screen.attron(attr)
+    rescue
+      @style_support[kind] = false
+    end
+  end
+
+  def safe_attroff(kind)
+    return unless @style_support[kind]
+    attr = ncurses_attr(kind)
+    return unless attr
+    begin
+      @screen.attroff(attr)
+    rescue
+      @style_support[kind] = false
+    end
+  end
+
+  def with_style(overrides)
+    saved = copy_style(@style_state)
+    overrides.each do |key, value|
+      @style_state.send("#{key}=", value)
+    end
+    apply_style(@style_state)
+    yield
+  ensure
+    @style_state = saved
+    apply_style(@style_state)
+  end
+
+  def build_inline_units(text, base_state)
+    tokens = scan_inline_tokens(text)
+    units = []
+    state = copy_style(base_state)
+    color_stack = []
+    tokens.each do |token|
+      case token[0]
+      when :text
+        s = token[1]
+        i = 0
+        while i < s.length
+          units << [s[i,1], state]
+          i += 1
+        end
+      when :style
+        state = copy_style(state)
+        if token[1] == :bold
+          state.bold = token[2]
+        elsif token[1] == :underline
+          state.underline = token[2]
+        elsif token[1] == :reverse
+          state.reverse = token[2]
+        end
+      when :color
+        color_pair = ColorMap.get_color_pair(token[1])
+        if color_pair
+          color_stack << state.color
+          state = copy_style(state)
+          state.color = color_pair
+        end
+      when :color_pop
+        if color_stack.length > 0
+          state = copy_style(state)
+          state.color = color_stack.pop
+        end
+      end
+    end
+    units
+  end
+
+  def wrap_units(units, width)
+    width = 1 if width < 1
+    return [[]] if units.length == 0
+    lines = []
+    idx = 0
+    while idx < units.length
+      remaining = units.length - idx
+      if remaining <= width
+        lines << units[idx..-1]
+        break
+      end
+      break_idx = nil
+      i = idx + width - 1
+      while i >= idx
+        if units[i][0] == " "
+          break_idx = i
+          break
+        end
+        i -= 1
+      end
+      if break_idx == nil || break_idx == idx
+        lines << units[idx, width]
+        idx += width
+      else
+        lines << units[idx...break_idx]
+        idx = break_idx + 1
+      end
+    end
+    lines
+  end
+
+  def units_to_segments(units)
+    segments = []
+    cur_state = nil
+    buffer = ""
+    units.each do |unit|
+      ch = unit[0]
+      state = unit[1]
+      if cur_state && state.equal?(cur_state)
+        buffer << ch
+      else
+        segments << [cur_state, buffer] if buffer.length > 0
+        cur_state = state
+        buffer = ch
+      end
+    end
+    segments << [cur_state, buffer] if buffer.length > 0
+    segments
+  end
+
+  def alignment_x(visible_length, align)
+    if align == :center
+      (@termwidth - visible_length) / 2
+    elsif align == :right
+      @termwidth - @indent - visible_length
+    else
+      @indent
+    end
+  end
+
+  def right_align_x(visible_length)
+    padding = (@output || @shelloutput) ? 2 : 0
+    x = @termwidth - @indent - padding - visible_length
+    x = @indent if x < @indent
+    x
+  end
+
+  def render_plain_lines(text, width, align, allow_shell, allow_slide)
+    lines = split_lines(text, width)
+    lines << "" if lines.length == 0
+    lines.each do |line|
+      @screen.move(@cur_line, @indent)
+      if (@output or @shelloutput) and ! @slideoutput
+        @screen.addstr("| ")
+      end
+      if align == :center
+        x = (@termwidth - line.length) / 2
+        @screen.move(@cur_line, x)
+        @screen.addstr(line)
+      elsif align == :right
+        x = right_align_x(line.length)
+        @screen.move(@cur_line, x)
+        @screen.addstr(line)
+      else
+        if allow_shell and @shelloutput and (line =~ /^\$/ or line =~ /^%/ or line =~ /^#/)
+          type_line(line)
+        elsif allow_slide
+          slide_text(line)
+        else
+          @screen.addstr(line)
+        end
+      end
+      if (@output or @shelloutput) and ! @slideoutput
+        @screen.move(@cur_line, @termwidth - @indent - 2)
+        @screen.addstr(" |")
+      end
+      @cur_line += 1
+    end
+  end
+
+  def render_inline_lines(text, width, align)
+    units = build_inline_units(text, @style_state)
+    lines = wrap_units(units, width)
+    lines.each do |line_units|
+      visible_length = line_units.length
+      x = alignment_x(visible_length, align)
+      @screen.move(@cur_line, x)
+      if line_units.length > 0
+        units_to_segments(line_units).each do |segment|
+          apply_style(segment[0])
+          @screen.addstr(segment[1])
+        end
+        apply_style(@style_state)
+      end
+      @cur_line += 1
+    end
+  end
+
+  def render_text(text, align)
+    return if text == nil
+    width = @termwidth - 2*@indent
+    width -= 2 if @output or @shelloutput
+    width = 1 if width < 1
+    if @output or @shelloutput
+      render_plain_lines(text, width, align, align == :left, false)
+    elsif align == :left && @slideoutput
+      render_plain_lines(strip_inline_tokens(text), width, align, false, true)
+    else
+      render_inline_lines(text, width, align)
+    end
   end
 
   def get_key
@@ -628,18 +962,18 @@ class NcursesVisualizer < TppVisualizer
   end
 
   def do_heading(line)
-    @screen.attron(Ncurses::A_BOLD)
-    print_heading(line)
-    @screen.attroff(Ncurses::A_BOLD)
+    with_style(:bold => true) do
+      render_text(line, :center)
+    end
   end
 
   def do_horline
-    @screen.attron(Ncurses::A_BOLD)
-    @termwidth.times do |x|
-      @screen.move(@cur_line,x)
-      @screen.addstr("-")
+    with_style(:bold => true) do
+      @termwidth.times do |x|
+        @screen.move(@cur_line,x)
+        @screen.addstr("-")
+      end
     end
-    @screen.attroff(Ncurses::A_BOLD)
   end
 
   def print_heading(text)
@@ -655,46 +989,11 @@ class NcursesVisualizer < TppVisualizer
   end
 
   def do_center(text)
-    width = @termwidth - 2*@indent
-    if @output or @shelloutput then
-      width -= 2
-    end
-    lines = split_lines(text,width)
-    lines.each do |l|
-      @screen.move(@cur_line,@indent)
-      if @output or @shelloutput then
-        @screen.addstr("| ")
-      end
-      x = (@termwidth - l.length)/2
-      @screen.move(@cur_line,x)
-      @screen.addstr(l)
-      if @output or @shelloutput then
-        @screen.move(@cur_line,@termwidth - @indent - 2)
-        @screen.addstr(" |")
-      end
-      @cur_line += 1
-    end
+    render_text(text, :center)
   end
 
   def do_right(text)
-    width = @termwidth - 2*@indent
-    if @output or @shelloutput then
-      width -= 2
-    end
-    lines = split_lines(text,width)
-    lines.each do |l|
-      @screen.move(@cur_line,@indent)
-      if @output or @shelloutput then
-        @screen.addstr("| ")
-      end
-      x = (@termwidth - l.length - 5)
-      @screen.move(@cur_line,x)
-      @screen.addstr(l)
-      if @output or @shelloutput then
-        @screen.addstr(" |")
-      end
-      @cur_line += 1
-    end
+    render_text(text, :right)
   end
 
   def show_help_page
@@ -805,27 +1104,33 @@ class NcursesVisualizer < TppVisualizer
   end
 
   def do_boldon
-    @screen.attron(Ncurses::A_BOLD)
+    @style_state.bold = true
+    apply_style(@style_state)
   end
 
   def do_boldoff
-    @screen.attroff(Ncurses::A_BOLD)
+    @style_state.bold = false
+    apply_style(@style_state)
   end
 
   def do_revon
-    @screen.attron(Ncurses::A_REVERSE)
+    @style_state.reverse = true
+    apply_style(@style_state)
   end
 
   def do_revoff
-    @screen.attroff(Ncurses::A_REVERSE)
+    @style_state.reverse = false
+    apply_style(@style_state)
   end
 
   def do_ulon
-    @screen.attron(Ncurses::A_UNDERLINE)
+    @style_state.underline = true
+    apply_style(@style_state)
   end
 
   def do_uloff
-    @screen.attroff(Ncurses::A_UNDERLINE)
+    @style_state.underline = false
+    apply_style(@style_state)
   end
 
   def do_beginslideleft
@@ -881,16 +1186,21 @@ class NcursesVisualizer < TppVisualizer
     else
       Ncurses.bkgd(Ncurses.COLOR_PAIR(1))
     end
+    apply_style(@style_state)
   end
 
   def do_fgcolor(color)
     @fgcolor = ColorMap.get_color_pair(color)
-    Ncurses.attron(Ncurses.COLOR_PAIR(@fgcolor))
+    @style_state.color = @fgcolor
+    apply_style(@style_state)
   end
 
   def do_color(color)
     num = ColorMap.get_color_pair(color)
-    Ncurses.attron(Ncurses.COLOR_PAIR(num))
+    if num
+      @style_state.color = num
+      apply_style(@style_state)
+    end
   end
 
   def type_line(l)
@@ -949,29 +1259,7 @@ class NcursesVisualizer < TppVisualizer
   end
 
   def print_line(line)
-    width = @termwidth - 2*@indent
-    if @output or @shelloutput then
-      width -= 2
-    end
-    lines = split_lines(line,width)
-    lines.each do |l|
-      @screen.move(@cur_line,@indent)
-      if (@output or @shelloutput) and ! @slideoutput then
-        @screen.addstr("| ")
-      end
-      if @shelloutput and (l =~ /^\$/ or l=~ /^%/ or l =~ /^#/) then # allow sh and csh style prompts
-        type_line(l)
-      elsif @slideoutput then
-        slide_text(l)
-      else
-        @screen.addstr(l)
-      end
-      if (@output or @shelloutput) and ! @slideoutput then
-        @screen.move(@cur_line,@termwidth - @indent - 2)
-        @screen.addstr(" |")
-      end
-      @cur_line += 1
-    end
+    render_text(line, :left)
   end
 
   def close
@@ -1025,10 +1313,26 @@ class NcursesVisualizer < TppVisualizer
     Ncurses.overwrite(s,@screen)
   end
 
-  def draw_slidenum(cur_page,max_pages,eop)
-    @screen.move(@termheight - 2, @indent)
-    @screen.attroff(Ncurses::A_BOLD) # this is bad
-    @screen.addstr("[slide #{cur_page}/#{max_pages}]")
+  def draw_slidenum(cur_page,max_pages,eop,title = nil)
+    with_style(:bold => false) do
+      status = "[slide #{cur_page}/#{max_pages}]"
+      max_width = @termwidth - @indent
+      if title and title.length > 0
+        available = max_width - status.length - 1
+        if available > 0
+          status = status + " " + title[0, available]
+        end
+      end
+      if status.length > max_width
+        status = status[0, max_width]
+      end
+      if @last_status_len > status.length
+        status = status + (" " * (@last_status_len - status.length))
+      end
+      @last_status_len = status.length
+      @screen.move(@termheight - 2, @indent)
+      @screen.addstr(status)
+    end
     if @footer_txt.to_s.length > 0 then
       do_footer(@footer_txt)
     end
@@ -1042,10 +1346,10 @@ class NcursesVisualizer < TppVisualizer
   end
 
   def draw_eop_marker
-    @screen.move(@termheight - 2, @indent - 1)
-    @screen.attron(A_BOLD)
-    @screen.addstr("*")
-    @screen.attroff(A_BOLD)
+    with_style(:bold => true) do
+      @screen.move(@termheight - 2, @indent - 1)
+      @screen.addstr("*")
+    end
   end
 
 end
@@ -1117,7 +1421,7 @@ class LatexVisualizer < TppVisualizer
 
   def do_heading(text)
     try_close
-    @f.puts "\\section{#{text}}"
+    @f.puts "\\section{#{strip_inline_tokens(text)}}"
   end
 
   def do_withborder
@@ -1226,6 +1530,7 @@ class LatexVisualizer < TppVisualizer
   end
 
   def print_line(line)
+    line = strip_inline_tokens(line)
     try_open
     split_lines(line,@width).each do |l|
       @f.puts "#{l}"
@@ -1233,19 +1538,20 @@ class LatexVisualizer < TppVisualizer
   end
 
   def do_title(title)
+    title = strip_inline_tokens(title)
     @f.puts "\\title[#{title}]{#{title}}"
     @title = true
     try_intro
   end
 
   def do_author(author)
-    @f.puts "\\author{#{author}}"
+    @f.puts "\\author{#{strip_inline_tokens(author)}}"
     @author = true
     try_intro
   end
 
   def do_date(date)
-    @f.puts "\\date{#{date}}"
+    @f.puts "\\date{#{strip_inline_tokens(date)}}"
     @date = true
     try_intro
   end
@@ -1321,7 +1627,7 @@ class AutoplayController < TppController
   def do_run
     loop do
       wait = false
-      @vis.draw_slidenum(@cur_page + 1, @pages.size, false)
+      @vis.draw_slidenum(@cur_page + 1, @pages.size, false, @pages[@cur_page].title)
       # read and visualize lines until the visualizer says "stop" or we reached end of page
       begin
         line = @pages[@cur_page].next_line
@@ -1329,7 +1635,7 @@ class AutoplayController < TppController
         wait = @vis.visualize(line)
       end while not wait and not eop
       # draw slide number on the bottom left and redraw:
-      @vis.draw_slidenum(@cur_page + 1, @pages.size, eop)
+      @vis.draw_slidenum(@cur_page + 1, @pages.size, eop, @pages[@cur_page].title)
       @vis.do_refresh
 
       if eop then
@@ -1379,7 +1685,7 @@ class InteractiveController < TppController
   def do_run
     loop do
       wait = false
-      @vis.draw_slidenum(@cur_page + 1, @pages.size, false)
+      @vis.draw_slidenum(@cur_page + 1, @pages.size, false, @pages[@cur_page].title)
       # read and visualize lines until the visualizer says "stop" or we reached end of page
       begin
         line = @pages[@cur_page].next_line
@@ -1387,7 +1693,7 @@ class InteractiveController < TppController
         wait = @vis.visualize(line)
       end while not wait and not eop
       # draw slide number on the bottom left and redraw:
-      @vis.draw_slidenum(@cur_page + 1, @pages.size, eop)
+      @vis.draw_slidenum(@cur_page + 1, @pages.size, eop, @pages[@cur_page].title)
       @vis.do_refresh
 
       # read a character from the keyboard
@@ -1489,7 +1795,7 @@ class TextVisualizer < TppVisualizer
 
   def do_heading(text)
     @f.puts "\n"
-    split_lines(text,@width).each do |l|
+    split_lines(strip_inline_tokens(text),@width).each do |l|
       @f.puts "#{l}\n"
     end
     @f.puts "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
@@ -1572,7 +1878,7 @@ class TextVisualizer < TppVisualizer
   def do_huge(text)
     output_width = @width
     output_width -= 2 if @output_env
-    op = IO.popen("figlet -f #{@figletfont} -w @output_width -k \"#{text}\"","r")
+    op = IO.popen("figlet -f #{@figletfont} -w #{output_width} -k \"#{text}\"","r")
     op.readlines.each do |line|
       print_line(line)
     end
@@ -1580,7 +1886,7 @@ class TextVisualizer < TppVisualizer
   end
 
   def print_line(line)
-    lines = split_lines(line,@width)
+    lines = split_lines(strip_inline_tokens(line),@width)
     lines.each do |l|
       if @output_env then
         @f.puts "| #{l}"
@@ -1591,7 +1897,7 @@ class TextVisualizer < TppVisualizer
   end
 
   def do_center(text)
-    lines = split_lines(text,@width)
+    lines = split_lines(strip_inline_tokens(text),@width)
     lines.each do |line|
       spaces = (@width - line.length) / 2
       spaces = 0 if spaces < 0
@@ -1601,7 +1907,7 @@ class TextVisualizer < TppVisualizer
   end
 
   def do_right(text)
-    lines = split_lines(text,@width)
+    lines = split_lines(strip_inline_tokens(text),@width)
     lines.each do |line|
       spaces = @width - line.length
       spaces = 0 if spaces < 0
@@ -1611,7 +1917,7 @@ class TextVisualizer < TppVisualizer
   end
 
   def do_title(title)
-    @f.puts "Title: #{title}"
+    @f.puts "Title: #{strip_inline_tokens(title)}"
     @title = true
     if @title and @author and @date then
       @f.puts "\n\n"
@@ -1619,7 +1925,7 @@ class TextVisualizer < TppVisualizer
   end
 
   def do_author(author)
-    @f.puts "Author: #{author}"
+    @f.puts "Author: #{strip_inline_tokens(author)}"
     @author = true
     if @title and @author and @date then
       @f.puts "\n\n"
@@ -1627,7 +1933,7 @@ class TextVisualizer < TppVisualizer
   end
 
   def do_date(date)
-    @f.puts "Date: #{date}"
+    @f.puts "Date: #{strip_inline_tokens(date)}"
     @date = true
     if @title and @author and @date then
       @f.puts "\n\n"

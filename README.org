@@ -131,6 +131,14 @@ following page-local commands are available:
 --ulon: switches on underlined printing
 --uloff: switches off underlined printing
 
+Inline formatting tokens within a line (ignored inside --beginoutput/--beginshelloutput):
+
+--b ... --/b: bold
+--u ... --/u: underline
+--rev ... --/rev: reverse video
+--c <color> ... --/c: color (same names as --color)
+\--b (or any \--) escapes the token and prints it literally.
+
 --huge <text>: <text> is drawn in huge letters. FIGlet is used to
     generate the huge letters.
 
@@ -222,5 +230,4 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307
 USA
                                                                                                 
-
 
